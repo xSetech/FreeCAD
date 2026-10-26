@@ -34,7 +34,10 @@
 
 */
 
+#include <memory>
+
 #include <QEvent>
+#include <QGuiApplication>
 #include <QMouseEvent>
 
 #include "QuarterWidget.h"
@@ -61,6 +64,70 @@ public:
   QuarterWidget * quarterwidget;
   QPoint globalmousepos;
   SbVec2s windowsize;
+
+  bool coalescemoves = false;
+  std::unique_ptr<QMouseEvent> pendingmove;
+
+  bool translate(QEvent * event)
+  {
+    // make sure every device has updated screen size and mouse position
+    // before translating events
+    switch (event->type()) {
+    case QEvent::MouseMove:
+    case QEvent::MouseButtonPress:
+    case QEvent::MouseButtonRelease:
+    case QEvent::MouseButtonDblClick:
+      this->trackPointerPosition(dynamic_cast<QMouseEvent *>(event));
+      break;
+    case QEvent::Resize:
+      this->trackWindowSize(dynamic_cast<QResizeEvent *>(event));
+      break;
+    default:
+      break;
+    }
+
+    Q_FOREACH(InputDevice * device, this->devices) {
+      const SoEvent * soevent = device->translateEvent(event);
+      if (soevent && this->quarterwidget->processSoEvent(soevent)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void processPendingMove()
+  {
+    if (this->pendingmove) {
+      const std::unique_ptr<QMouseEvent> move = std::move(this->pendingmove);
+      this->translate(move.get());
+    }
+  }
+
+  static bool appliesPendingMove(QEvent::Type type)
+  {
+    switch (type) {
+    case QEvent::MouseButtonPress:
+    case QEvent::MouseButtonRelease:
+    case QEvent::MouseButtonDblClick:
+    case QEvent::Wheel:
+    case QEvent::KeyPress:
+    case QEvent::KeyRelease:
+    case QEvent::Leave:
+    case QEvent::ContextMenu:
+    case QEvent::Resize:
+    case QEvent::NativeGesture:
+    case QEvent::Gesture:
+    case QEvent::TouchBegin:
+    case QEvent::TouchUpdate:
+    case QEvent::TouchEnd:
+    case QEvent::TabletPress:
+    case QEvent::TabletMove:
+    case QEvent::TabletRelease:
+      return true;
+    default:
+      return false;
+    }
+  }
 
   void trackWindowSize(QResizeEvent * event)
   {
@@ -104,6 +171,9 @@ EventFilter::EventFilter(QObject * parent)
 
   PRIVATE(this)->windowsize = SbVec2s(PRIVATE(this)->quarterwidget->width(),
                                       PRIVATE(this)->quarterwidget->height());
+
+  PRIVATE(this)->coalescemoves =
+      QGuiApplication::platformName().startsWith(QLatin1String("wayland"));
 
   PRIVATE(this)->devices += new Mouse(quarter);
   PRIVATE(this)->devices += new Keyboard(quarter);
@@ -150,31 +220,27 @@ bool
 EventFilter::eventFilter(QObject * obj, QEvent * qevent)
 {
   Q_UNUSED(obj); 
-  // make sure every device has updated screen size and mouse position
-  // before translating events
-  switch (qevent->type()) {
-  case QEvent::MouseMove:
-  case QEvent::MouseButtonPress:
-  case QEvent::MouseButtonRelease:
-  case QEvent::MouseButtonDblClick:
-    PRIVATE(this)->trackPointerPosition(dynamic_cast<QMouseEvent *>(qevent));
-    break;
-  case QEvent::Resize:
-    PRIVATE(this)->trackWindowSize(dynamic_cast<QResizeEvent *>(qevent));
-    break;
-  default:
-    break;
+  if (PRIVATE(this)->coalescemoves) {
+    if (qevent->type() == QEvent::MouseMove) {
+      auto * move = static_cast<QMouseEvent *>(qevent);
+      PRIVATE(this)->globalmousepos = move->globalPosition().toPoint();
+      const bool scheduled = PRIVATE(this)->pendingmove != nullptr;
+      PRIVATE(this)->pendingmove.reset(move->clone());
+      if (!scheduled) {
+        QMetaObject::invokeMethod(
+            this, [this]() { PRIVATE(this)->processPendingMove(); },
+            Qt::QueuedConnection);
+      }
+      return true;
+    }
+    if (EventFilterP::appliesPendingMove(qevent->type())) {
+      PRIVATE(this)->processPendingMove();
+    }
   }
 
   // translate QEvent into SoEvent and see if it is handled by scene
   // graph
-  Q_FOREACH(InputDevice * device, PRIVATE(this)->devices) {
-    const SoEvent * soevent = device->translateEvent(qevent);
-    if (soevent && PRIVATE(this)->quarterwidget->processSoEvent(soevent)) {
-      return true;
-    }
-  }
-  return false;
+  return PRIVATE(this)->translate(qevent);
 }
 
 /*!
